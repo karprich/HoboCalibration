@@ -1,0 +1,207 @@
+---
+title: "HoboCalibration"
+author: "Rich"
+date: "11/5/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning=FALSE, message=FALSE, cache = TRUE, fig.width=6, fig.asp=.618, out.width='70%', fig.align='center')
+
+library(readxl)
+library(lubridate)
+library(tidyverse)
+library(ggplot2)
+library(magrittr)
+library(stringr)
+library(RColorBrewer)
+library(kableExtra)
+```
+
+## Calibrate HOBOs from CSV
+
+Test was run from 11/4/2020 14:45 to 11/5/2020 12:30. One cooler was used with two tank replicates and 6 hobos in each. Tanks are named left and right.
+
+```{r arduino log, include=FALSE}
+
+arduinoLog <- read_delim('LOG.TXT', delim=',') %>%
+  filter(N_ms!='N_ms') %>%
+  
+  mutate(Date=ymd(Date), Time=hms(paste(Th, Tm, Ts, sep=':')), newDate=ymd_hms(paste(Date, Time))) %>%
+  select('Date'=newDate, 'setPoint'=T1SP, TempT1, TempT2, TempT3, TempT4) %>%
+  pivot_longer(3:6, names_to = 'Probe', names_prefix = 'TempT', values_to = 'Temp') %>%
+  filter(Temp>0 & Temp<50) %>%
+  mutate(Tank=ifelse(Probe=='1', 'Right', 
+                     ifelse(Probe=='3', 'Right', 'Left')))
+
+arduinoLog$Temp <- as.numeric(arduinoLog$Temp)
+arduinoLog$setPoint <- as.numeric(arduinoLog$setPoint)
+arduinoLog$Type <- 'Arduino'
+
+
+p <- ggplot(arduinoLog, aes(Date, Temp)) +
+  geom_line(aes(color=Probe), alpha=0.7) +
+  facet_wrap(~Probe, ncol=2) +
+  scale_color_brewer(palette = 'Dark2') +
+  geom_line(aes(Date, setPoint), color='red') +
+  ylim(25, 40)
+
+arduinoLog$roundDate <- floor_date(arduinoLog$Date, 'minute') 
+
+setPoint <- arduinoLog %>%
+  filter(Probe==1, !duplicated(roundDate)) %>%
+  select('Date'=roundDate, setPoint) %>%
+  filter(Date<ymd_hm('2020-11-04 16:10')|Date>=ymd_hm('2020-11-04 16:30'), #38 Ramp
+        Date<ymd_hm('2020-11-04 17:20')|Date>=ymd_hm('2020-11-04 17:30'), #37 ramp
+        Date<ymd_hm('2020-11-04 18:00')|Date>=ymd_hm('2020-11-04 18:10'), #36 ramp
+        Date<ymd_hm('2020-11-04 18:40')|Date>=ymd_hm('2020-11-04 18:50'), #35 ramp
+        Date<ymd_hm('2020-11-04 19:20')|Date>=ymd_hm('2020-11-04 19:30'), #34 ramp
+        Date<ymd_hm('2020-11-04 20:00')|Date>=ymd_hm('2020-11-04 20:10'), #33 ramp
+        Date<ymd_hm('2020-11-04 20:40')|Date>=ymd_hm('2020-11-04 20:50'), #32 ramp
+        Date<ymd_hm('2020-11-04 21:20')|Date>=ymd_hm('2020-11-04 21:30'), #31 ramp
+        Date<ymd_hm('2020-11-04 22:10')|Date>=ymd_hm('2020-11-04 22:30'), #30 ramp
+        Date<ymd_hm('2020-11-04 22:50')|Date>ymd_hm('2020-11-04 23:10'))  #27 ramp
+```
+
+```{r HOBOs, include=FALSE}
+
+hoboFiles <- list.files('Hobo', pattern = '*.csv', full.names = T)
+
+allHobo <- NULL
+
+for(i in 1:length(hoboFiles)){
+  hoboData <- read_csv(hoboFiles[i], col_names = c('Date', 'Temp', 1:5)) %>%
+  select(Date, Temp)%>%
+  mutate('Name'=str_trim(str_sub(basename(hoboFiles[i]), 1, 3)), 'SN'=str_extract(Date[1], '[0-9]+'), 'shortSN'=str_sub(SN,5, 8), 'Probe'=as.factor(i+4)) %>%
+  filter(!is.na(Temp),!str_detect(Temp, '[Temp*]'))
+  
+  allHobo <- bind_rows(allHobo, hoboData)
+}
+
+allHobo$Date <- ymd_hms(allHobo$Date)
+allHobo$Temp <- as.numeric(allHobo$Temp)
+
+#Hobos in which tank
+rightTank <- c('3463', '5040', '0765', '5041', '0768', '3462')
+leftTank <- c('0767', '4982', '5039', '0764', '3461', '0766')
+
+allHobo$Tank <- ifelse(allHobo$shortSN %in% rightTank, 'Right', 'Left')
+allHobo$Type <- 'Hobo'
+
+p <- ggplot(allHobo, aes(Date, Temp)) +
+  geom_line(aes(color=Probe)) +
+  facet_wrap(~Probe)
+
+```
+
+
+```{r combineTemps, echo=FALSE}
+
+allTemps <- bind_rows(arduinoLog, allHobo)
+
+p <- ggplot(allTemps, aes(Date, Temp)) +
+  geom_line(data=setPoint, aes(Date, setPoint), color='red', size=1) +
+  geom_line(aes(color=Probe), alpha=0.5) +
+  facet_grid(Tank~Type) +
+  
+  ylim(27, 39) +
+  labs(title='Raw data of hobo and arduino with red line showing setpoint')
+
+p
+```
+
+
+Should probably take out Arduino T3 as it is much higher than the T1 probe and seemed wonky.
+
+```{r calibrate offset, echo=FALSE}
+
+allHobo$roundDate <- floor_date(allHobo$Date, 'minute')
+
+
+arduinoSmooth <- arduinoLog %>%
+  group_by('Date'=roundDate, Probe, Tank) %>%
+  summarise(Temp=mean(Temp)) %>%
+  ungroup() %>%
+  mutate(Type='Arduino') 
+
+
+
+p <- ggplot(arduinoSmooth, aes(roundDate, Temp)) +
+  geom_line(aes(color=Probe), alpha=0.7) +
+  facet_wrap(~Probe, ncol=2) +
+  scale_color_brewer(palette = 'Dark2') +
+  geom_line(data=setPoint, aes(Date, setPoint), color='red') +
+  ylim(25, 40)
+
+
+arduinoTemp <- arduinoSmooth %>%
+  split(.$Tank) %>%
+  map(~pivot_wider(., names_from = Probe, values_from = Temp, names_prefix = 'probe')) %>%
+  map(~left_join(.,setPoint, by=c('Date'))) %>%
+  map(~filter(., Date>mdy_hm('11/4/2020 15:00'))) %>%
+  map(~mutate(., 'arduinoDiff'=.[[5]] - .[[4]], 'meanArduinoTemp'=(.[[5]] + .[[4]])/2,
+         'arduinoOffset'=meanArduinoTemp-setPoint)) %>%
+  do.call(bind_rows, .)
+
+p <- ggplot(arduinoTemp, aes(Date, arduinoOffset)) +
+  geom_line(aes(color=Tank)) +
+  facet_wrap(~Tank) +
+  labs(title='Arduino difference between probes')
+p
+  
+allHobo$Tank <- as.factor(allHobo$Tank)
+
+hobosCalibrate <- allHobo %>%
+  filter(Date>mdy_hm('11/4/2020 15:00')) %>%
+  select(Name, shortSN, Probe, Tank, 'Date'=roundDate, Temp) %>%
+  split(.$Probe) %>%
+  map(~left_join(., arduinoTemp, by=c('Date', 'Tank'))) %>%
+  map(~mutate(.,'hoboArduinoOffset'=Temp-meanArduinoTemp, 
+              'hoboSetpointOffset'=Temp-setPoint)) %>%
+  do.call(bind_rows,.) %>%
+  select(c(1:6, 10, 16:17)) %>%
+  filter(abs(hoboSetpointOffset)<1.5) %>%
+  arrange(Name, Date)
+
+p <- ggplot(hobosCalibrate, aes(Date, hoboArduinoOffset)) +
+  geom_line(aes(color=Probe), alpha=0.5) +
+  facet_wrap(~Tank) +
+  labs(title='Offset between Hobo and Average Arduino Temp probes' ) +
+  geom_smooth(method = 'glm', se=F, aes(group=Probe), color='black')
+
+p
+
+
+  
+
+```
+
+
+```{r models and average offset}
+p <- ggplot(hobosCalibrate, aes(setPoint, hoboArduinoOffset)) +
+  geom_point(aes(color=Tank)) +
+  facet_wrap(~Name) +
+  geom_smooth(method='glm', se=F) +
+  labs(title='Are there differences between temperatures and hobo?')
+p
+
+lmHobo <- hobosCalibrate %>%
+  #filter(setPoint<=34) %>%
+  split(.$Name) %>%
+  map(~lm(hoboArduinoOffset~setPoint, data=.))
+
+lmHobo %>%
+  map(anova) 
+
+averageOffset <- hobosCalibrate %>%
+  group_by(Name,shortSN, Tank) %>%
+  summarise(meanOffset=mean(hoboArduinoOffset, na.rm = T),
+            sd=sd(hoboArduinoOffset, na.rm=T)) %>%
+  ungroup() 
+
+averageOffset %>%
+  kable(col.names = c('Hobo Name', 'Last 4 SN', 'Tank', 'Mean Offset', 'SD')) %>%
+  kable_styling(bootstrap_options = c('striped', 'hover', 'condensed'), full_width = FALSE)
+```
+
+Appears there is significance at temperatures for the Right sides tanks. Should probably take out T3 and just use T1 arduino probe for differences
